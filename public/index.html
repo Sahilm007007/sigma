@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Agar.io Multiplayer with Extras</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: black; }
+    canvas { display: block; }
+    /* Hide the cursor when pointer is locked */
+    .pointerLocked { cursor: none; }
+    /* Leaderboard styling */
+    #leaderboard {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.5);
+      color: white;
+      padding: 10px;
+      font-family: Arial, sans-serif;
+      z-index: 10;
+    }
+    /* Name entry modal styling */
+    #nameModal {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.8);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 20;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+    #nameModal input, #nameModal select {
+      padding: 10px;
+      font-size: 16px;
+      margin: 10px;
+    }
+    #nameModal button {
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    /* Texture preview styling */
+    #texturePreview {
+      margin: 10px;
+      width: 100px;
+      height: auto;
+      border: 2px solid white;
+    }
+  </style>
+  <!-- Include Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- Include Socket.IO client library -->
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <!-- Leaderboard -->
+  <div id="leaderboard"></div>
+  <!-- Name entry modal -->
+  <div id="nameModal">
+    <h2>Enter your name to join:</h2>
+    <input type="text" id="playerName" placeholder="Your name">
+    <h3>Select Your Texture</h3>
+    <select id="textureSelect">
+      <option value="1.webp">Texture 1</option>
+      <option value="2.webp">Texture 2</option>
+      <option value="3.png">Texture 3</option>
+      <option value="4.jpg">Texture 4</option>
+      <option value="watcher.png">Watcher (for fun)</option>
+    </select>
+    <img id="texturePreview" src="1.jpg" alt="Texture Preview">
+    <button id="joinButton">Join Game</button>
+  </div>
+
+  <script>
+    // Global variables.
+    let socket;
+    let myId = null;
+    let gameStarted = false;
+    let selectedTexturePath = "1.jpg";
+
+    // Dictionaries for meshes.
+    const playersMeshes = {};    // key: player id, value: Mesh
+    const playersTargets = {};   // key: player id, value: THREE.Vector3
+    const planetMeshes = {};     // key: planet id, value: Mesh
+    const boostMeshes = {};      // key: boost id, value: Group
+    const watcherSprites = {};   // key: watcher id, value: THREE.Sprite
+
+    // Texture cache.
+    const textureCache = {};
+    function getTexture(path) {
+      if (textureCache[path]) {
+        return textureCache[path];
+      } else {
+        const texture = new THREE.TextureLoader().load(path, function(tex) {
+          tex.needsUpdate = true;
+        });
+        textureCache[path] = texture;
+        return texture;
+      }
+    }
+
+    // -------------------- Three.js Setup --------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    const camera = new THREE.PerspectiveCamera(
+      75, window.innerWidth / window.innerHeight, 0.1, 10000
+    );
+    let cameraYaw = 0, cameraPitch = 0;
+    let cameraDistance = 300;
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -------------------- Lighting --------------------
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(1, 1, 1).normalize();
+    scene.add(directionalLight);
+
+    // -------------------- Background Galaxies --------------------
+    const textureLoader = new THREE.TextureLoader();
+    textureLoader.load('https://assets.science.nasa.gov/dynamicimage/assets/science/astro/universe/2023/09/swift_M31_mosaic_1600.webp', function(texture) {
+      const geometry = new THREE.SphereGeometry(5000, 32, 32);
+      const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide });
+      const backgroundSphere = new THREE.Mesh(geometry, material);
+      scene.add(backgroundSphere);
+    });
+
+    // -------------------- Pointer Lock Setup --------------------
+    document.addEventListener('pointerlockchange', onPointerLockChange, false);
+    function onPointerLockChange() {
+      if (document.pointerLockElement === renderer.domElement) {
+        document.body.classList.add('pointerLocked');
+      } else {
+        document.body.classList.remove('pointerLocked');
+      }
+    }
+    document.addEventListener('mousemove', (event) => {
+      if (document.pointerLockElement === renderer.domElement) {
+        const sensitivity = 0.002;
+        cameraYaw   -= event.movementX * sensitivity;
+        cameraPitch -= event.movementY * sensitivity;
+        const maxPitch = Math.PI / 2 - 0.01;
+        cameraPitch = Math.max(-maxPitch, Math.min(maxPitch, cameraPitch));
+      }
+    });
+
+    // -------------------- Mouse Scroll for Zooming --------------------
+    window.addEventListener('wheel', (e) => {
+      cameraDistance += e.deltaY * 0.1;
+      cameraDistance = Math.max(100, Math.min(1000, cameraDistance));
+    });
+
+    // -------------------- Keyboard Input --------------------
+    const keys = {};
+    window.addEventListener('keydown', (e) => { keys[e.key.toLowerCase()] = true; });
+    window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+    // -------------------- Update Texture Preview --------------------
+    const textureSelect = document.getElementById('textureSelect');
+    const texturePreview = document.getElementById('texturePreview');
+    textureSelect.addEventListener('change', () => {
+      selectedTexturePath = textureSelect.value;
+      texturePreview.src = selectedTexturePath;
+    });
+
+    // -------------------- Helper: Default Earth Texture --------------------
+    function createEarthTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#1E90FF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#32CD32';
+      ctx.beginPath();
+      ctx.ellipse(150, 100, 80, 40, Math.PI / 6, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(350, 150, 60, 30, -Math.PI / 4, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.beginPath();
+      ctx.arc(250, 50, 20, 0, 2 * Math.PI);
+      ctx.fill();
+      return new THREE.CanvasTexture(canvas);
+    }
+
+    // -------------------- Leaderboard --------------------
+    function updateLeaderboard(playersData) {
+      const playersArray = Object.values(playersData);
+      playersArray.sort((a, b) => b.radius - a.radius);
+      const leaderboardDiv = document.getElementById('leaderboard');
+      let html = '<h3>Leaderboard</h3><ol>';
+      playersArray.forEach(player => {
+        html += `<li>${player.name} (${Math.floor(player.radius)})</li>`;
+      });
+      html += '</ol>';
+      leaderboardDiv.innerHTML = html;
+    }
+
+    // -------------------- Socket.IO Communication --------------------
+    function initSocket(name, texture) {
+      socket = io();
+      socket.emit('setName', { name: name, texture: texture });
+      socket.on('init', (data) => {
+        myId = data.id;
+        // Create meshes for players.
+        for (let id in data.players) {
+          const p = data.players[id];
+          const texPath = p.texture || "1.jpg";
+          const material = new THREE.MeshPhongMaterial({ map: getTexture(texPath) });
+          const geom = new THREE.SphereGeometry(p.radius, 32, 32);
+          const mesh = new THREE.Mesh(geom, material);
+          mesh.position.set(p.position.x, p.position.y, p.position.z);
+          scene.add(mesh);
+          playersMeshes[id] = mesh;
+          playersTargets[id] = new THREE.Vector3(p.position.x, p.position.y, p.position.z);
+        }
+        // Create planet meshes.
+        data.planets.forEach(planet => {
+          const geom = new THREE.SphereGeometry(planet.radius, 16, 16);
+          const mat = new THREE.MeshPhongMaterial({ color: planet.color });
+          const mesh = new THREE.Mesh(geom, mat);
+          mesh.position.set(planet.position.x, planet.position.y, planet.position.z);
+          scene.add(mesh);
+          planetMeshes[planet.id] = mesh;
+        });
+        // Create boost pellet meshes.
+        data.boosts.forEach(boost => {
+          const group = new THREE.Group();
+          const sphereGeom = new THREE.SphereGeometry(boost.radius, 16, 16);
+          const sphereMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+          const sphereMesh = new THREE.Mesh(sphereGeom, sphereMat);
+          group.add(sphereMesh);
+          const ringGeom = new THREE.RingGeometry(boost.radius * 1.2, boost.radius * 1.4, 32);
+          const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+          const ringMesh = new THREE.Mesh(ringGeom, ringMat);
+          ringMesh.rotation.x = Math.PI / 2;
+          group.add(ringMesh);
+          group.position.set(boost.position.x, boost.position.y, boost.position.z);
+          scene.add(group);
+          boostMeshes[boost.id] = group;
+        });
+        // Create watcher pellet sprites.
+        data.watchers.forEach(watcher => {
+          const spriteMaterial = new THREE.SpriteMaterial({ map: getTexture("watcher.png"), transparent: true });
+          const sprite = new THREE.Sprite(spriteMaterial);
+          // Scale watchers appropriately.
+          sprite.scale.set(watcher.radius * 20, watcher.radius * 20, 1);
+          sprite.position.set(watcher.position.x, watcher.position.y, watcher.position.z);
+          // Initialize a target rotation property for smooth dancing.
+          sprite.userData.targetRotation = 0;
+          scene.add(sprite);
+          watcherSprites[watcher.id] = sprite;
+        });
+      });
+
+      socket.on('gameState', (state) => {
+        updateLeaderboard(state.players);
+        // Update or create player meshes.
+        for (let id in state.players) {
+          const p = state.players[id];
+          const texPath = p.texture || "1.jpg";
+          if (playersMeshes[id]) {
+            if (id === myId) {
+              const currentMap = playersMeshes[id].material.map;
+              if (!currentMap || !currentMap.image || !currentMap.image.src || currentMap.image.src.indexOf(texPath) === -1) {
+                playersMeshes[id].material.map = getTexture(texPath);
+                playersMeshes[id].material.needsUpdate = true;
+              }
+            }
+            playersTargets[id].set(p.position.x, p.position.y, p.position.z);
+            const mesh = playersMeshes[id];
+            const newScale = p.radius / mesh.geometry.parameters.radius;
+            mesh.scale.set(newScale, newScale, newScale);
+          } else {
+            const material = new THREE.MeshPhongMaterial({ map: getTexture(texPath) });
+            const geom = new THREE.SphereGeometry(p.radius, 32, 32);
+            const mesh = new THREE.Mesh(geom, material);
+            scene.add(mesh);
+            playersMeshes[id] = mesh;
+            playersTargets[id] = new THREE.Vector3(p.position.x, p.position.y, p.position.z);
+          }
+        }
+        for (let id in playersMeshes) {
+          if (!state.players[id]) {
+            scene.remove(playersMeshes[id]);
+            delete playersMeshes[id];
+            delete playersTargets[id];
+          }
+        }
+        // Update or create planet meshes.
+        state.planets.forEach(planet => {
+          if (!planetMeshes[planet.id]) {
+            const geom = new THREE.SphereGeometry(planet.radius, 16, 16);
+            const mat = new THREE.MeshPhongMaterial({ color: planet.color });
+            const mesh = new THREE.Mesh(geom, mat);
+            scene.add(mesh);
+            planetMeshes[planet.id] = mesh;
+          } else {
+            const mesh = planetMeshes[planet.id];
+            const newScale = planet.radius / mesh.geometry.parameters.radius;
+            mesh.scale.set(newScale, newScale, newScale);
+          }
+          planetMeshes[planet.id].position.set(planet.position.x, planet.position.y, planet.position.z);
+        });
+        for (let id in planetMeshes) {
+          if (!state.planets.find(p => p.id === id)) {
+            scene.remove(planetMeshes[id]);
+            delete planetMeshes[id];
+          }
+        }
+        // Update or create boost pellet meshes.
+        state.boosts.forEach(boost => {
+          if (!boostMeshes[boost.id]) {
+            const group = new THREE.Group();
+            const sphereGeom = new THREE.SphereGeometry(boost.radius, 16, 16);
+            const sphereMat = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+            const sphereMesh = new THREE.Mesh(sphereGeom, sphereMat);
+            group.add(sphereMesh);
+            const ringGeom = new THREE.RingGeometry(boost.radius * 1.2, boost.radius * 1.4, 32);
+            const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+            const ringMesh = new THREE.Mesh(ringGeom, ringMat);
+            ringMesh.rotation.x = Math.PI / 2;
+            group.add(ringMesh);
+            group.position.set(boost.position.x, boost.position.y, boost.position.z);
+            scene.add(group);
+            boostMeshes[boost.id] = group;
+          } else {
+            boostMeshes[boost.id].position.set(boost.position.x, boost.position.y, boost.position.z);
+          }
+        });
+        for (let id in boostMeshes) {
+          if (!state.boosts.find(b => b.id === id)) {
+            scene.remove(boostMeshes[id]);
+            delete boostMeshes[id];
+          }
+        }
+        // Update or create watcher pellet sprites.
+        state.watchers.forEach(watcher => {
+          if (!watcherSprites[watcher.id]) {
+            const spriteMaterial = new THREE.SpriteMaterial({ map: getTexture("watcher.png"), transparent: true });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(watcher.radius * 2, watcher.radius * 2, 1);
+            sprite.position.set(watcher.position.x, watcher.position.y, watcher.position.z);
+            // Initialize target rotation property.
+            sprite.userData.targetRotation = 0;
+            scene.add(sprite);
+            watcherSprites[watcher.id] = sprite;
+          } else {
+            watcherSprites[watcher.id].position.set(watcher.position.x, watcher.position.y, watcher.position.z);
+          }
+        });
+        for (let id in watcherSprites) {
+          if (!state.watchers.find(w => w.id === id)) {
+            scene.remove(watcherSprites[id]);
+            delete watcherSprites[id];
+          }
+        }
+      });
+    }
+
+    // -------------------- Beat Detection for Watcher Dance --------------------
+    let audioContext, analyser, dataArray, bufferLength;
+    let lastBeatTime = 0;
+    const beatThreshold = 100;    // Adjust as needed
+    const minBeatInterval = 300;  // Minimum milliseconds between beats
+
+    function startBeatDetection(audioElement) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioContext.state === "suspended") {
+        audioContext.resume();
+      }
+      const track = audioContext.createMediaElementSource(audioElement);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      bufferLength = analyser.frequencyBinCount;
+      dataArray = new Uint8Array(bufferLength);
+      track.connect(analyser);
+      analyser.connect(audioContext.destination);
+      detectBeat();
+    }
+
+    function detectBeat() {
+      analyser.getByteFrequencyData(dataArray);
+      let sum = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        sum += dataArray[i];
+      }
+      const average = sum / bufferLength;
+      const now = performance.now();
+      if (average > beatThreshold && (now - lastBeatTime) > minBeatInterval) {
+        beatHandler();
+        lastBeatTime = now;
+      }
+      requestAnimationFrame(detectBeat);
+    }
+
+    // Instead of an instant snap, we update each watcher sprite’s target rotation.
+    // We toggle the target between +45° and -45°.
+    function beatHandler() {
+      for (let id in watcherSprites) {
+        let sprite = watcherSprites[id];
+        // If no target rotation is set, initialize it to 45°.
+        if (typeof sprite.userData.targetRotation === 'undefined') {
+          sprite.userData.targetRotation = 45 * Math.PI / 180;
+        } else {
+          // Toggle between +45° and -45°.
+          if (sprite.userData.targetRotation > 0) {
+            sprite.userData.targetRotation = -45 * Math.PI / 180;
+          } else {
+            sprite.userData.targetRotation = 45 * Math.PI / 180;
+          }
+        }
+      }
+    }
+
+    // In the animation loop, smoothly interpolate watcher material rotation toward target.
+    function updateWatcherDancing(delta) {
+      for (let id in watcherSprites) {
+        let sprite = watcherSprites[id];
+        let target = sprite.userData.targetRotation || 0;
+        // Use an exponential lerp for smooth motion.
+        sprite.material.rotation = THREE.MathUtils.lerp(sprite.material.rotation, target, delta * 10);
+      }
+    }
+
+    // -------------------- Animation Loop --------------------
+    let lastTime = performance.now();
+    function animate() {
+      requestAnimationFrame(animate);
+      const currentTime = performance.now();
+      const delta = (currentTime - lastTime) / 1000;
+      lastTime = currentTime;
+
+      let moveVector = new THREE.Vector3();
+      const forward = new THREE.Vector3(
+        Math.cos(cameraPitch) * Math.sin(cameraYaw),
+        Math.sin(cameraPitch),
+        Math.cos(cameraPitch) * Math.cos(cameraYaw)
+      ).normalize();
+      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0)).normalize();
+      if (keys['w']) moveVector.add(forward);
+      if (keys['s']) moveVector.sub(forward);
+      if (keys['d']) moveVector.add(right);
+      if (keys['a']) moveVector.sub(right);
+      if (moveVector.length() > 0) moveVector.normalize();
+
+      if (gameStarted && socket) {
+        socket.emit('playerInput', { moveVector: { x: moveVector.x, y: moveVector.y, z: moveVector.z }, delta });
+      }
+
+      for (let id in playersMeshes) {
+        if (playersTargets[id]) {
+          const lerpFactor = (id === myId) ? 0.2 : 0.1;
+          playersMeshes[id].position.lerp(playersTargets[id], lerpFactor);
+        }
+      }
+
+      // Update watcher dancing smoothly.
+      updateWatcherDancing(delta);
+
+      if (myId && playersMeshes[myId]) {
+        const playerPos = playersMeshes[myId].position;
+        const camOffset = forward.clone().multiplyScalar(cameraDistance);
+        camera.position.copy(playerPos)
+          .add(new THREE.Vector3(0, 50, 0))
+          .sub(camOffset);
+        camera.lookAt(playerPos);
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // -------------------- Join Game Event --------------------
+    document.getElementById('joinButton').addEventListener('click', () => {
+      const nameInput = document.getElementById('playerName').value;
+      const playerName = nameInput.trim() || "Anonymous";
+      document.getElementById('nameModal').style.display = 'none';
+      gameStarted = true;
+      // Randomly select one of 4 soundtracks.
+      const soundtrackIndex = Math.floor(Math.random() * 4) + 1;
+      const soundtrackPath = "soundtrack" + soundtrackIndex + ".mp3";
+      const audio = new Audio(soundtrackPath);
+      audio.loop = true;
+      audio.playbackRate = 1.1;
+      audio.defaultPlaybackRate = 1.1;
+      audio.play();
+      // Start beat detection.
+      startBeatDetection(audio);
+      initSocket(playerName, selectedTexturePath);
+      // Request pointer lock.
+      renderer.domElement.requestPointerLock();
+    });
+  </script>
+</body>
+</html>
